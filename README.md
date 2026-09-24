@@ -124,6 +124,7 @@ bash scripts/deploy.sh
 
 - 复现路线参考 [hxdoit](https://github.com/hxdoit) 的 HIL-SERL 分支
 - 框架：[LeRobot](https://github.com/huggingface/lerobot)
+- 参考资料：[知乎专栏文章](https://zhuanlan.zhihu.com/p/1976053620911906986)
 
 ## 📄 License
 
