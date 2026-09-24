@@ -2,6 +2,14 @@
 
 基于 **HIL-SERL**（Human-in-the-Loop Sample-Efficient Reinforcement Learning）的真机强化学习项目，运行在 SO-ARM101 六自由度机械臂上，使用 LeRobot 框架完成「少量示教 → 在线自主探索 → 真机稳定执行」的完整闭环。
 
+## 🎥 演示效果
+
+![demo](assets/demo.gif)
+
+> 21,000 步策略在真机上自主完成推物体（手机实拍，8 倍速）
+>
+> 另有体积更小的动画 WebP 版：`assets/demo.webp`（2.5 MB，GIF 为 6.9 MB）
+
 ## 📊 成果概览
 
 - **任务**：把物体（灰色方块 / 灰色圆柱）推进黑胶带目标区
@@ -34,6 +42,15 @@
 | so101-smolvla-grasping | 视觉语言动作模型 | — | 多任务、可泛化 |
 | **so101-hilserl-pushing** | **在线强化学习 HIL-SERL** | **12 条示教 + 在线自采** | **样本效率高，失败能自己纠正** |
 
+### 训练曲线
+
+| Actor loss | Critic loss |
+|---|---|
+| ![loss_actor](results/training_curves/loss_actor.png) | ![loss_critic](results/training_curves/loss_critic.png) |
+
+> 曲线导出自 wandb（项目 `push_cylinder`，21,000 步）。
+> ⚠️ 训练指标**只往 wandb 送** —— 配置里 `wandb.enable=false` 时终端和日志里一个字都没有，详见 [03 模型训练](docs/03-模型训练.md)。
+
 ## 📁 目录结构
 
 ```
@@ -45,8 +62,8 @@ so101-hilserl-pushing/
 ├── verify/      # 配置自检脚本（跑真机前先过一遍）
 ├── urdf/        # 真机 IK 用的 URDF
 ├── data/        # 数据集说明（数据集托管在 HuggingFace）
-├── results/     # 演示视频（外链）
-└── assets/      # README 配图
+├── results/     # 训练曲线图 + 演示视频（完整版走外链）
+└── assets/      # README 演示动图（demo.gif / demo.webp）
 ```
 
 ## 🚀 快速复现
