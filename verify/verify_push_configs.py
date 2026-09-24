@@ -4,6 +4,7 @@
 为什么必须这么验：draccus 的 ChoiceRegistry 靠【import 副作用】注册类型，
 所以验证时必须 import 与入口完全一致的模块集合，否则会假报"未知类型"。
 """
+import os
 import sys
 
 sys.argv = [sys.argv[0]]  # 防 draccus 抢 argv
@@ -16,7 +17,16 @@ from pathlib import Path
 
 import draccus
 
-CFG = Path("/home/lbc/Projects/AI-Study/hilserl/configs/official")
+# 配置目录自适应：原工程是 configs/official/，打包仓库里是 configs/
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+if (_ROOT / "configs" / "official").is_dir():
+    CFG = _ROOT / "configs" / "official"          # 原工程布局
+elif (_ROOT / "configs").is_dir():
+    CFG = _ROOT / "configs"                        # 打包仓库布局
+else:
+    CFG = Path("/home/lbc/Projects/AI-Study/hilserl/configs/official")  # 兜底
+CFG = Path(os.environ.get("VERIFY_CONFIG_DIR", CFG))
 ok = True
 
 

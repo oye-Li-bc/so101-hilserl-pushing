@@ -4,6 +4,10 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# ⚠️ 必须清掉 PYTHONPATH：环境里若有一个指向别的 Python 版本的路径，
+#    会串来不兼容的 numpy（表现为 "Importing the numpy C-extensions failed"）
+unset PYTHONPATH
+
 PY=~/miniconda3/envs/lerobot/bin/python
 
 "$PY" -m lerobot.rl.actor \

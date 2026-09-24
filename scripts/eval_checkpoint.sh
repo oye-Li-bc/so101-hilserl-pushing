@@ -7,6 +7,10 @@ cd "$(dirname "$0")/.."
 
 STEP=${1:?用法: bash scripts/eval_checkpoint.sh <步数，如 0021000>}
 CKPT=/home/lbc/output_lerobot_train/push_cylinder/sac_v1/checkpoints/$STEP/pretrained_model
+# ⚠️ 必须清掉 PYTHONPATH：环境里若有一个指向别的 Python 版本的路径，
+#    会串来不兼容的 numpy（表现为 "Importing the numpy C-extensions failed"）
+unset PYTHONPATH
+
 PY=~/miniconda3/envs/lerobot/bin/python
 
 [ -d "$CKPT" ] || { echo "找不到检查点: $CKPT"; exit 1; }
