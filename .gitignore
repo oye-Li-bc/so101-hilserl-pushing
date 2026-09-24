@@ -1,0 +1,27 @@
+# 忽略大文件与敏感信息
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 模型权重（托管在 HuggingFace，不放 GitHub）
+*.safetensors
+*.pt
+*.pth
+checkpoints/
+eval_*/
+
+# 数据集（托管在 HuggingFace）
+*.parquet
+data/chunk-*/
+data/videos/
+
+# 演示视频（放 B站，README 放链接）
+*.mp4
+results/demo_video/*.mp4
+!results/demo_video/README.md
+
+# 系统文件
+.DS_Store
+Thumbs.db

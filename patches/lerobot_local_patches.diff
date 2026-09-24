@@ -1,0 +1,1214 @@
+diff --git a/src/lerobot/configs/policies.py b/src/lerobot/configs/policies.py
+index 4da0fb9e..2d926f67 100644
+--- a/src/lerobot/configs/policies.py
++++ b/src/lerobot/configs/policies.py
+@@ -134,7 +134,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
+         if not self.input_features:
+             return None
+         for ft_name, ft in self.input_features.items():
+-            if ft.type is FeatureType.STATE and ft_name == OBS_STATE:
++            if ft.type == FeatureType.STATE and ft_name == OBS_STATE:
+                 return ft
+         return None
+ 
+@@ -143,7 +143,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
+         if not self.input_features:
+             return None
+         for _, ft in self.input_features.items():
+-            if ft.type is FeatureType.ENV:
++            if ft.type == FeatureType.ENV:
+                 return ft
+         return None
+ 
+@@ -151,14 +151,14 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
+     def image_features(self) -> dict[str, PolicyFeature]:
+         if not self.input_features:
+             return {}
+-        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
++        return {key: ft for key, ft in self.input_features.items() if ft.type == FeatureType.VISUAL}
+ 
+     @property
+     def action_feature(self) -> PolicyFeature | None:
+         if not self.output_features:
+             return None
+         for ft_name, ft in self.output_features.items():
+-            if ft.type is FeatureType.ACTION and ft_name == ACTION:
++            if ft.type == FeatureType.ACTION and ft_name == ACTION:
+                 return ft
+         return None
+ 
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index e3d35469..5fe1ab95 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -233,10 +233,16 @@ class TrainPipelineConfig(HubMixin):
+             else:
+                 self.job_name = f"{self.env.type}_{active_cfg.type}"
+ 
+-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
++        # 本地定制（2026-09-21）：HIL-SERL 的 actor / learner 双进程共用同一个 output_dir，
++        # 先启动的一方会创建目录 → 后启动的一方（actor 根本用不到 resume）会误报 FileExistsError。
++        # 改为：只有目录里【已有检查点】（真有一次训练成果会被覆盖）时才拦截。
++        _ckpt = self.output_dir / "checkpoints" if isinstance(self.output_dir, Path) else None
++        _has_prior_run = bool(_ckpt is not None and _ckpt.is_dir() and any(_ckpt.iterdir()))
++        if not self.resume and _has_prior_run:
+             raise FileExistsError(
+-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
+-                f"Please change your output directory so that {self.output_dir} is not overwritten."
++                f"Output directory {self.output_dir} already exists (with checkpoints) and resume is "
++                f"{self.resume}. Please change your output directory so that {self.output_dir} is not "
++                f"overwritten."
+             )
+         elif not self.output_dir:
+             now = dt.datetime.now()
+diff --git a/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py b/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
+index a833d01c..ad8a28f1 100644
+--- a/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
++++ b/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
+@@ -15,6 +15,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import logging
+ from collections.abc import Callable
+ from dataclasses import asdict
+ 
+@@ -531,6 +532,27 @@ def freeze_image_encoder(image_encoder: nn.Module):
+         param.requires_grad = False
+ 
+ 
++class _TimmVisionWrapper(nn.Module):
++    """把 timm 模型包装成 transformers 风格：forward(x).last_hidden_state 为 4D 特征图。
++
++    PretrainedImageEncoder.forward 会读 `.last_hidden_state`，transformers 的 CNN 模型
++    （如 ResNetModel）正好提供该字段，这里给 timm 模型补上同样的接口。
++    """
++
++    class _Out:
++        __slots__ = ("last_hidden_state",)
++
++        def __init__(self, last_hidden_state):
++            self.last_hidden_state = last_hidden_state
++
++    def __init__(self, model: nn.Module):
++        super().__init__()
++        self.model = model
++
++    def forward(self, x):
++        return _TimmVisionWrapper._Out(self.model.forward_features(x))
++
++
+ class PretrainedImageEncoder(nn.Module):
+     def __init__(self, config: GaussianActorConfig):
+         super().__init__()
+@@ -539,6 +561,40 @@ class PretrainedImageEncoder(nn.Module):
+ 
+     def _load_pretrained_vision_encoder(self, config: GaussianActorConfig):
+         """Set up CNN encoder"""
++        _name = config.vision_encoder_name
++
++        # 本地定制（2026-09-21）：HF 不可达时唯一的预训练视觉特征来源——
++        # 用 timm 加载【本地】权重文件。约定：
++        #     vision_encoder_name = "timm:<架构>:<本地权重文件路径>"
++        # 例：timm:resnet18:/home/lbc/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth
++        # 为什么重要：HIL-SERL 论文用 ImageNet 预训练 ResNet10；本项目 HF 不通、无法下载，
++        # 若退回"从零训练的小 CNN"，策略学不会视觉伺服（实测 6000+ 步仍无法对准目标）。
++        if isinstance(_name, str) and _name.startswith("timm:"):
++            import timm
++
++            arch, _, weights_path = _name[len("timm:") :].partition(":")
++            model = timm.create_model(arch, pretrained=False, num_classes=1000)
++            if weights_path:
++                _sd = torch.load(weights_path, map_location="cpu", weights_only=True)
++                missing, unexpected = model.load_state_dict(_sd, strict=False)
++                logging.info(
++                    f"[vision] timm {arch} 载入本地权重：{weights_path} "
++                    f"（{len(_sd)} 个张量，missing={len(missing)}, unexpected={len(unexpected)}）"
++                )
++                if unexpected or len(missing) > max(1, int(0.1 * len(_sd))):
++                    raise ValueError(
++                        f"timm {arch} 与权重文件不匹配：missing={len(missing)}, unexpected={len(unexpected)}"
++                    )
++            if config.freeze_vision_encoder:
++                model.eval()  # 冻结参数的同时冻结 BN 统计，保证预训练特征不被破坏
++            self.image_enc_layers = _TimmVisionWrapper(model)
++            self.image_enc_out_shape = int(getattr(model, "num_features", 512))
++            logging.info(
++                f"[vision] 使用 timm 预训练编码器 {arch}，输出通道 {self.image_enc_out_shape}，"
++                f"参数 {sum(x.numel() for x in model.parameters()) / 1e6:.2f}M"
++            )
++            return self.image_enc_layers, self.image_enc_out_shape
++
+         from transformers import AutoModel
+ 
+         self.image_enc_layers = AutoModel.from_pretrained(config.vision_encoder_name, trust_remote_code=True)
+diff --git a/src/lerobot/processor/normalize_processor.py b/src/lerobot/processor/normalize_processor.py
+index 1649b4b3..31eb6b0b 100644
+--- a/src/lerobot/processor/normalize_processor.py
++++ b/src/lerobot/processor/normalize_processor.py
+@@ -186,8 +186,11 @@ class _NormalizationMixin:
+         """
+         flat: dict[str, Tensor] = {}
+         for key, sub in self._tensor_stats.items():
+-            for stat_name, tensor in sub.items():
+-                flat[f"{key}.{stat_name}"] = tensor.cpu()  # Always save to CPU
++            if isinstance(sub, Tensor):
++                flat[key] = sub.cpu()
++            else:
++                for stat_name, tensor in sub.items():
++                    flat[f"{key}.{stat_name}"] = tensor.cpu()
+         return flat
+ 
+     def load_state_dict(self, state: dict[str, Tensor]) -> None:
+@@ -226,21 +229,29 @@ class _NormalizationMixin:
+         # Normal behavior: load stats from state_dict
+         self._tensor_stats.clear()
+         for flat_key, tensor in state.items():
+-            key, stat_name = flat_key.rsplit(".", 1)
+-            # Load to the processor's configured device.
+-            self._tensor_stats.setdefault(key, {})[stat_name] = tensor.to(
+-                dtype=torch.float32, device=self.device
+-            )
++            if "." in flat_key:
++                key, stat_name = flat_key.rsplit(".", 1)
++                self._tensor_stats.setdefault(key, {})[stat_name] = tensor.to(
++                    dtype=torch.float32, device=self.device
++                )
++            else:
++                # Flat key (no dot): store directly
++                self._tensor_stats[flat_key] = tensor.to(
++                    dtype=torch.float32, device=self.device
++                )
+         self._reshape_visual_stats()
+ 
+         # Reconstruct the original stats dict from tensor stats for compatibility with to() method
+         # and other functions that rely on self.stats
+         self.stats = {}
+-        for key, tensor_dict in self._tensor_stats.items():
+-            self.stats[key] = {}
+-            for stat_name, tensor in tensor_dict.items():
+-                # Convert tensor back to python/numpy format
+-                self.stats[key][stat_name] = from_tensor_to_numpy(tensor)
++        for key, value in self._tensor_stats.items():
++            if isinstance(value, dict):
++                self.stats[key] = {}
++                for stat_name, tensor in value.items():
++                    self.stats[key][stat_name] = from_tensor_to_numpy(tensor)
++            else:
++                # Flat tensor entry
++                self.stats[key] = from_tensor_to_numpy(value)
+ 
+     def get_config(self) -> dict[str, Any]:
+         """
+diff --git a/src/lerobot/rl/actor.py b/src/lerobot/rl/actor.py
+index bfc7f188..8c1bd8eb 100644
+--- a/src/lerobot/rl/actor.py
++++ b/src/lerobot/rl/actor.py
+@@ -88,7 +88,7 @@ from lerobot.configs import parser
+ from lerobot.policies import make_policy, make_pre_post_processors
+ from lerobot.processor import TransitionKey
+ from lerobot.robots import so_follower  # noqa: F401
+-from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
++from lerobot.teleoperators import gamepad, keyboard, so_leader  # noqa: F401  # 本地定制：补 keyboard（keyboard_ee 未注册会解析失败）
+ from lerobot.teleoperators.utils import TeleopEvents
+ from lerobot.utils.device_utils import get_safe_torch_device
+ from lerobot.utils.process import ProcessSignalHandler
+@@ -310,6 +310,32 @@ def act_with_policy(
+             k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
+         }
+ 
++        # ── 本地定制（2026-09-22）：把【策略实际看到的图像】dump 到磁盘 ──
++        # 用途：训练是长跑，光看日志数字不知道策略"眼里"是什么样。crop 裁偏、
++        #       颜色异常、物体被遮挡这类问题只有看图才能发现。
++        # 行为：每 POLICY_VIEW_EVERY 帧覆盖写一次（默认 10 帧，设 0 关闭）。
++        #       只写两张小图（128x128），磁盘和耗时都可忽略。
++        _pv_every = int(os.environ.get("POLICY_VIEW_EVERY", "10"))
++        if _pv_every > 0 and interaction_step % _pv_every == 0:
++            try:
++                import cv2 as _cv2
++                from pathlib import Path as _Path
++
++                _pv_dir = _Path(cfg.output_dir or "/tmp") / "policy_view"
++                _pv_dir.mkdir(parents=True, exist_ok=True)
++                for _k, _v in observation.items():
++                    if "image" not in _k:
++                        continue
++                    _t = _v[0] if _v.ndim == 4 else _v
++                    _a = _t.detach().permute(1, 2, 0).cpu().numpy()
++                    if _a.dtype != "uint8":
++                        _a = (_a * 255).clip(0, 255).astype("uint8")
++                    _cv2.imwrite(str(_pv_dir / f"{_k.split('.')[-1]}.png"),
++                                 _cv2.cvtColor(_a, _cv2.COLOR_RGB2BGR))
++                (_pv_dir / "step.txt").write_text(str(interaction_step))
++            except Exception as _e:  # 绝不能因为画图把训练搞挂
++                logging.debug(f"[ACTOR] policy_view dump skipped: {_e}")
++
+         # Time policy inference and check if it meets FPS requirement
+         with policy_timer:
+             normalized_observation = preprocessor.process_observation(observation)
+diff --git a/src/lerobot/rl/buffer.py b/src/lerobot/rl/buffer.py
+index cec80b72..cd35269f 100644
+--- a/src/lerobot/rl/buffer.py
++++ b/src/lerobot/rl/buffer.py
+@@ -78,6 +78,26 @@ def random_shift(images: torch.Tensor, pad: int = 4):
+     return random_crop_vectorized(images=images, output_size=(h, w))
+ 
+ 
++def _normalize_image_value(key: str, value) -> "torch.Tensor":
++    """本地定制（2026-09-21）：把数据集里 0-255 的 float 图像换算到 0-1。
++
++    为什么必须做：运行时观测管线（processor/env_processor.py）会执行 `img.float()/255.0`，
++    而策略的归一化统计量（dataset_stats）也是 0-1 尺度。若示范数据（从 LeRobotDataset
++    读出的是 0-255 float32）不换算，示范图像经归一化后会变成上千的饱和值，视觉编码器
++    学不到任何有效特征 —— 现象就是"无论训多久、无论人怎么接管，策略完全不会做任务"。
++    """
++    if not (isinstance(value, torch.Tensor) and "image" in key and value.numel() > 0):
++        return value
++    # ① LeRobotDataset 读图像给的是 uint8 0-255（实测）→ 转 float 并 /255，与运行时一致
++    if not value.is_floating_point():
++        return value.float() / 255.0
++    # ② 已是 0-255 的 float（某些数据集/格式）→ 同样换算
++    if float(value.max()) > 1.5:
++        return (value / 255.0).clamp(0.0, 1.0)
++    # ③ 已经是 0-1 → 原样返回（避免重复除）
++    return value
++
++
+ class ReplayBuffer:
+     def __init__(
+         self,
+@@ -570,7 +590,13 @@ class ReplayBuffer:
+ 
+             # Fill the data for state keys
+             for key in self.states:
+-                frame_dict[key] = self.states[key][actual_idx].cpu()
++                value = self.states[key][actual_idx].cpu()
++                # 本地定制（2026-09-21）：HIL-SERL 的图像是 0-255 的 float，而 LeRobotDataset
++                # 的图片写入要求 0-1 float 或 uint8 → 不归一化会报
++                # "The image data type is float, which requires values in the range [0.0, 1.0]"
++                # 并（在 learner 的检查点存盘路径里）拖垮整个训练循环。
++                value = _normalize_image_value(key, value)
++                frame_dict[key] = value
+ 
+             # Fill action, reward, done
+             frame_dict[ACTION] = self.actions[actual_idx].cpu()
+@@ -662,6 +688,7 @@ class ReplayBuffer:
+             current_state: dict[str, torch.Tensor] = {}
+             for key in state_keys:
+                 val = current_sample[key]
++                val = _normalize_image_value(key, val)  # 本地定制：0-255 → 0-1
+                 current_state[key] = val.unsqueeze(0)  # Add batch dimension
+ 
+             # ----- 2) Action -----
+@@ -697,6 +724,7 @@ class ReplayBuffer:
+                     next_state_data: dict[str, torch.Tensor] = {}
+                     for key in state_keys:
+                         val = next_sample[key]
++                        val = _normalize_image_value(key, val)  # 本地定制：0-255 → 0-1
+                         next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
+                     next_state = next_state_data
+ 
+diff --git a/src/lerobot/rl/gym_manipulator.py b/src/lerobot/rl/gym_manipulator.py
+index 03f7b4ee..28d31e82 100644
+--- a/src/lerobot/rl/gym_manipulator.py
++++ b/src/lerobot/rl/gym_manipulator.py
+@@ -509,6 +509,9 @@ def make_processors(
+             ),
+             EEBoundsAndSafety(
+                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
++                # 本地定制：单帧位移超限时【限速】而不是抛 ValueError
++                # （默认 True 会直接终止控制循环，表现为"持续推一个方向程序自己退出"）
++                raise_on_jump=False,
+             ),
+             GripperVelocityToJoint(
+                 clip_max=cfg.processor.max_gripper_pos,
+@@ -768,9 +771,18 @@ def control_loop(
+             logging.info("Waiting for image writer to finish...")
+             dataset.writer.image_writer.stop()
+ 
++        # 本地修复（2026-09-21）：finalize() 必须【无条件】调用，不能只在
++        # push_to_hub=True 时调用。finalize() 才真正把 footer 元数据写进 parquet；
++        # 不调用时只剩 DatasetWriter.__del__ 这个"安全网"兜底，而它在解释器关闭时
++        # 引用的对象可能已被回收，异常还会被 contextlib.suppress 静默吞掉 ——
++        # 于是数据集随机损坏，读取时报 pyarrow:
++        #   "Parquet magic bytes not found in footer."
++        # 放在 finally 里可同时覆盖 Ctrl+C 正常中断的情形。
++        if dataset is not None:
++            logging.info("Finalizing dataset")
++            dataset.finalize()
++
+     if dataset is not None and cfg.dataset.push_to_hub:
+-        logging.info("Finalizing dataset before pushing to hub")
+-        dataset.finalize()
+         logging.info("Pushing dataset to hub")
+         dataset.push_to_hub()
+ 
+diff --git a/src/lerobot/rl/learner.py b/src/lerobot/rl/learner.py
+index 41cfd8c0..a7f7840e 100644
+--- a/src/lerobot/rl/learner.py
++++ b/src/lerobot/rl/learner.py
+@@ -48,6 +48,7 @@ import logging
+ import os
+ import shutil
+ import time
++from dataclasses import dataclass
+ from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
+ from pprint import pformat
+@@ -83,7 +84,7 @@ from lerobot.configs import parser
+ from lerobot.datasets import LeRobotDataset, make_dataset
+ from lerobot.policies import make_policy, make_pre_post_processors
+ from lerobot.robots import so_follower  # noqa: F401
+-from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
++from lerobot.teleoperators import gamepad, keyboard, so_leader  # noqa: F401  # 本地定制：补 keyboard（keyboard_ee 未注册会解析失败）
+ from lerobot.teleoperators.utils import TeleopEvents
+ from lerobot.transport.utils import (
+     MAX_MESSAGE_SIZE,
+@@ -247,7 +248,9 @@ def start_learner_threads(
+         )
+         logging.info("[LEARNER] Training process stopped")
+     except Exception:
+-        logging.exception("[LEARNER] Unhandled exception in training loop")
++        import traceback as _tb
++        logging.error("[LEARNER] Unhandled exception in training loop\n" + _tb.format_exc())
++        print("\n=== [LEARNER] 完整异常栈 ===\n" + _tb.format_exc() + "=== 结束 ===\n", flush=True)
+         shutdown_event.set()
+     finally:
+         logging.info("[LEARNER] Closing queues")
+@@ -354,6 +357,50 @@ def add_actor_information_and_train(
+             device=device,
+             storage_device=storage_device,
+         )
++        # 本地定制（2026-09-21）启动自检：把示范图像的数值范围打印出来。
++        # 为什么需要：示范图像若不换算成 0-1（与运行时一致），策略会看到饱和垃圾而完全学不会任务，
++        # 且这种错误【完全静默】—— 不看数值根本发现不了。这行日志就是每次开跑的证据。
++        try:
++            _n = offline_replay_buffer.size
++            for _k in [k for k in offline_replay_buffer.states if "image" in k]:
++                _v = offline_replay_buffer.states[_k][:_n].float()
++                _lo, _hi = float(_v.min()), float(_v.max())
++                _ok = _hi <= 1.0 + 1e-6
++                logging.info(
++                    f"[LEARNER] 示范图像尺度自检 {_k}: 值域=[{_lo:.3f}, {_hi:.3f}] "
++                    + ("✅ 正常（0-1，与运行时观测一致）" if _ok else
++                       "❌ 异常！>1 说明示范图像未换算成 0-1，策略将学不到任务，请勿继续训练")
++                )
++        except Exception as _e:  # 自检本身绝不能影响训练
++            logging.warning(f"[LEARNER] 示范图像尺度自检失败（不影响训练）: {_e}")
++    # 本地定制（2026-09-21）：动作归一化自检 —— 防止"批量动作未归一化"这种静默致命 bug 复活。
++    # 背景：critic 用批量动作训练，而策略网络输出的是归一化尺度动作；两者不一致时 TD 目标自相矛盾，
++    # 策略会几千步都学不会，而日志/损失/参数量全都看不出异常。这里在启动时用一组已知数值直接验证。
++    try:
++        from lerobot.rl.trainer import _find_pipeline_step
++        from lerobot.types import TransitionKey
++
++        norm_step = _find_pipeline_step(preprocessor, "NormalizerProcessorStep")
++        probe = torch.tensor([[0.5, 0.0, -0.5, 1.0]], dtype=torch.float32)
++        if norm_step is None:
++            logging.error(
++                "[LEARNER] 动作归一化自检 ❌ 处理器管道里找不到 NormalizerProcessorStep "
++                "→ critic 会与策略网络尺度不一致，策略学不会"
++            )
++        else:
++            out = norm_step({TransitionKey.ACTION: probe})[TransitionKey.ACTION].detach().cpu()
++            ok = abs(float(out[0, 3]) - 0.0) < 1e-4 and abs(float(out[0, 0]) - 0.5) < 1e-4
++            logging.info(
++                "[LEARNER] 动作归一化自检 %s → %s %s",
++                probe.tolist()[0],
++                [round(float(v), 3) for v in out[0]],
++                "✅ 正常（critic 与策略网络同尺度，能学）"
++                if ok
++                else "❌ 异常：批量动作没被归一化 → TD 目标自相矛盾 → 策略学不会",
++            )
++    except Exception as exc:  # noqa: BLE001
++        logging.error("[LEARNER] 动作归一化自检 ❌ 执行失败: %s: %s", type(exc).__name__, exc)
++
+ 
+     # DataMixer: online-only or online/offline 50-50 mix
+     data_mixer = OnlineOfflineMixer(
+@@ -385,6 +432,12 @@ def add_actor_information_and_train(
+     if cfg.dataset is not None:
+         dataset_repo_id = cfg.dataset.repo_id
+ 
++    # 本地定制（2026-09-21）：实时进度行所需状态
++    episode_stats = EpisodeStats()
++    last_progress_log = time.time()
++    last_optimization_hz: float | None = None
++    last_training_infos: dict = {}  # 累积最近一次已知的损失/温度（actor 损失隔若干步才算，覆盖会时有时无）
++
+     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
+     while True:
+         # Exit the training loop if shutdown is requested
+@@ -408,6 +461,33 @@ def add_actor_information_and_train(
+             wandb_logger=wandb_logger,
+             shutdown_event=shutdown_event,
+         )
++        # 本地定制（2026-09-21）：每回合打一行进度（训练步数 + 回合奖励 + 干预比例），
++        # 让「策略有没有在变好」有客观判据，而不是靠感觉。
++        if interaction_message is not None:
++            logging.info(
++                format_episode_progress_line(
++                    optimization_step=algorithm.optimization_step,
++                    online_steps=online_steps,
++                    interaction_message=interaction_message,
++                )
++            )
++        if interaction_message is not None:
++            episode_stats.update(interaction_message)
++
++        # 本地定制（2026-09-21）：每 ~10 秒一行【实时进度】，用户随时知道走到哪、还剩多久
++        if time.time() - last_progress_log >= 10:
++            logging.info(
++                format_progress_summary(
++                    optimization_step=algorithm.optimization_step,
++                    online_steps=online_steps,
++                    online_size=len(replay_buffer),
++                    offline_size=len(offline_replay_buffer) if offline_replay_buffer is not None else 0,
++                    hz=last_optimization_hz,
++                    stats=episode_stats,
++                    training_infos=last_training_infos,
++                )
++            )
++            last_progress_log = time.time()
+ 
+         # Wait until the replay buffer has enough samples to start training
+         if len(replay_buffer) < online_step_before_learning:
+@@ -440,8 +520,13 @@ def add_actor_information_and_train(
+         # Calculate and log optimization frequency
+         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
+         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
++        # 本地定制（2026-09-21）：把 Hz 与算法指标留给上面的【实时进度】行使用，
++        # 不再每步打一行 `Optimization frequency loop [Hz]`（那是刷屏噪音，用户看不见有用信息）
++        last_optimization_hz = frequency_for_one_optimization_step
++        # 合并而非覆盖：actor 损失/温度是隔若干步才算的，覆盖会导致实时行里时有时无
++        last_training_infos.update(training_infos)   # 已经在本轮循环前面算好（stats.to_log_dict()）
+ 
+-        logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
++        # （原每步 Hz 日志已由上面的【实时进度】行取代）
+ 
+         # Log optimization frequency
+         if wandb_logger:
+@@ -627,22 +712,12 @@ def save_training_checkpoint(
+     if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+         shutil.rmtree(dataset_dir)
+ 
+-    # Save dataset
+-    # NOTE: Handle the case where the dataset repo id is not specified in the config
+-    # eg. RL training without demonstrations data
+-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+-
+-    if offline_replay_buffer is not None:
+-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+-            shutil.rmtree(dataset_offline_dir)
+-
+-        offline_replay_buffer.to_lerobot_dataset(
+-            cfg.dataset.repo_id,
+-            fps=fps,
+-            root=dataset_offline_dir,
+-        )
++    # ── 本地定制（2026-09-21）：以下"把回放池导出成数据集"的代码，源码自己标注为
++    #    `# TODO : temporary save replay buffer here, remove later when on the robot`。
++    #    实测三个问题：① 每次存检查点都重写数千张图（磁盘爆炸）② 图像范围 bug 会抛异常
++    #    拖垮整个训练循环（已崩过一次）③ 对训练本身毫无用处。
++    #    → 本地禁用；如需导出，取消注释即可（buffer.py 里的图片范围问题也已修好）。
++    _ = (dataset_repo_id, cfg, replay_buffer, offline_replay_buffer, dataset_dir, fps)
+ 
+     logging.info("Resume training")
+ 
+@@ -814,17 +889,31 @@ def initialize_replay_buffer(
+     repo_id = None
+     if cfg.dataset is not None:
+         repo_id = cfg.dataset.repo_id
+-    dataset = LeRobotDataset(
+-        repo_id=repo_id,
+-        root=dataset_path,
+-    )
+-    return ReplayBuffer.from_lerobot_dataset(
+-        lerobot_dataset=dataset,
+-        capacity=cfg.policy.online_buffer_capacity,
+-        device=device,
+-        state_keys=cfg.policy.input_features.keys(),
+-        optimize_memory=True,
+-    )
++    # 本地定制（2026-09-21）：导出目录不可用（缺失/不完整）时不要让续训崩掉，
++    # 回退成"空在线缓冲池"——策略权重与优化器状态仍然从检查点恢复，只是丢掉在线经验。
++    try:
++        dataset = LeRobotDataset(
++            repo_id=repo_id,
++            root=dataset_path,
++        )
++        return ReplayBuffer.from_lerobot_dataset(
++            lerobot_dataset=dataset,
++            capacity=cfg.policy.online_buffer_capacity,
++            device=device,
++            state_keys=cfg.policy.input_features.keys(),
++            optimize_memory=True,
++        )
++    except Exception as e:
++        logging.warning(
++            f"[LEARNER] 在线数据集不可用（{type(e).__name__}: {e}）→ 回退：使用空在线缓冲池"
++        )
++        return ReplayBuffer(
++            capacity=cfg.policy.online_buffer_capacity,
++            device=device,
++            state_keys=cfg.policy.input_features.keys(),
++            storage_device=storage_device,
++            optimize_memory=True,
++        )
+ 
+ 
+ def initialize_offline_replay_buffer(
+@@ -849,10 +938,22 @@ def initialize_offline_replay_buffer(
+     else:
+         logging.info("load offline dataset")
+         dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
+-        offline_dataset = LeRobotDataset(
+-            repo_id=cfg.dataset.repo_id,
+-            root=dataset_offline_path,
+-        )
++        # 本地定制（2026-09-21）：该导出目录可能【不完整】（例如上次存检查点时崩溃留下的
++        # 半成品），直接加载会报错并终结整个续训 → 先校验帧数，不可用就回退到源数据集重建。
++        try:
++            offline_dataset = LeRobotDataset(
++                repo_id=cfg.dataset.repo_id,
++                root=dataset_offline_path,
++            )
++            _src = make_dataset(cfg)
++            if len(offline_dataset) != len(_src):
++                raise ValueError(f"导出不完整: {len(offline_dataset)} 帧 vs 源数据集 {len(_src)} 帧")
++            logging.info(f"[LEARNER] 离线数据集加载成功（{len(offline_dataset)} 帧）")
++        except Exception as e:
++            logging.warning(
++                f"[LEARNER] 离线数据集不可用（{type(e).__name__}: {e}）→ 回退：从源数据集重建"
++            )
++            offline_dataset = make_dataset(cfg)
+ 
+     logging.info("Convert to a offline replay buffer")
+     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
+@@ -982,6 +1083,92 @@ def process_transitions(
+                 offline_replay_buffer.add(**transition)
+ 
+ 
++@dataclass
++class EpisodeStats:
++    """累计 actor 报上来的回合统计（供实时进度行使用）。"""
++
++    episodes: int = 0
++    successes: int = 0
++    zero_intervention_successes: int = 0
++    _rate_sum: float = 0.0
++    _rate_n: int = 0
++
++    def update(self, message: dict) -> None:
++        self.episodes += 1
++        reward, rate = message.get("Episodic reward"), message.get("Intervention rate")
++        if isinstance(reward, (int, float)) and float(reward) >= 1.0:
++            self.successes += 1
++            if isinstance(rate, (int, float)) and float(rate) == 0:
++                self.zero_intervention_successes += 1
++        if isinstance(rate, (int, float)):
++            self._rate_sum += float(rate)
++            self._rate_n += 1
++
++    @property
++    def avg_intervention_rate(self) -> float | None:
++        return self._rate_sum / self._rate_n if self._rate_n else None
++
++
++def format_progress_summary(
++    optimization_step: int,
++    online_steps: int,
++    online_size: int,
++    offline_size: int,
++    hz: float | None,
++    stats: EpisodeStats,
++    training_infos: dict | None = None,
++) -> str:
++    """本地定制（2026-09-21）：一行【实时进度】。
++
++    为什么：原来只有每 100 步一行 `Number of optimization step`，中间每步还刷一行
++    `Optimization frequency loop [Hz]`（噪音）→ 用户看不出"还要多久 / 学得怎么样"。
++    这行把 训练步+百分比、回放池大小、优化频率、预计剩余时间、回合/成功/★、平均干预比例、
++    以及算法侧的 loss 放在一起，每 ~10 秒打一次。
++    """
++    pct = f"{optimization_step / online_steps * 100:.1f}%" if online_steps else "?"
++    parts = [f"训练步 {optimization_step}/{online_steps} ({pct})",
++             f"在线池 {online_size} 帧",
++             f"离线池 {offline_size} 帧"]
++    parts.append(f"优化 {hz:.1f} Hz" if hz else "优化 —")
++    if hz and online_steps and optimization_step < online_steps:
++        parts.append(f"剩余约 {(online_steps - optimization_step) / hz / 60:.0f} 分钟")
++    parts.append(f"回合 {stats.episodes}（成功 {stats.successes}，★ {stats.zero_intervention_successes}）")
++    rate = stats.avg_intervention_rate
++    parts.append(f"平均干预 {rate * 100:.0f}%" if rate is not None else "平均干预 —")
++    if training_infos:
++        picked = [f"{k} {v:.3f}" for k, v in training_infos.items()
++                  if isinstance(v, (int, float))
++                  and any(t in k.lower() for t in ("loss", "temperature", "q_", "entropy"))][:2]
++        parts.extend(picked)
++    return "[LEARNER] 实时进度 | " + " | ".join(parts)
++
++
++def format_episode_progress_line(
++    optimization_step: int,
++    online_steps: int,
++    interaction_message: dict,
++) -> str:
++    """把每回合的进度拼成一行可判断「它有没有在变好」的日志。
++
++    本地定制（2026-09-21）：系统一直在算 ``Intervention rate``，但从未打印过 ——
++    于是「策略到底有没有进步」只能靠感觉。把【训练步数 + 交互步 + 回合奖励 + 干预比例】
++    放在同一行后，判据变客观：**干预比例下降**、并且出现**零干预的成功回合**。
++    """
++    rate = interaction_message.get("Intervention rate")
++    rate_txt = f"{rate * 100:.0f}%" if isinstance(rate, (int, float)) else "?"
++    pct = f"{optimization_step / online_steps * 100:.1f}%" if online_steps else "?"
++    reward = interaction_message.get("Episodic reward", "?")
++    line = (
++        f"[LEARNER] 回合结束 | 训练步 {optimization_step}/{online_steps} ({pct})"
++        f" | 交互步 {interaction_message.get('Interaction step', '?')}"
++        f" | 回合奖励 {reward} | 干预比例 {rate_txt}"
++    )
++    # 最有价值的一类回合：全程没接管（干预 0%）且成功 —— 这才是「策略自己会了」
++    if isinstance(rate, (int, float)) and rate == 0 and isinstance(reward, (int, float)) and float(reward) >= 1.0:
++        line += "  ★ 零干预成功"
++    return line
++
++
+ def process_interaction_messages(
+     interaction_message_queue: Queue,
+     interaction_step_shift: int,
+diff --git a/src/lerobot/rl/trainer.py b/src/lerobot/rl/trainer.py
+index 65f00568..3d635060 100644
+--- a/src/lerobot/rl/trainer.py
++++ b/src/lerobot/rl/trainer.py
+@@ -17,7 +17,7 @@ from __future__ import annotations
+ from collections.abc import Iterator
+ from typing import Any
+ 
+-from lerobot.types import BatchType
++from lerobot.types import BatchType, TransitionKey
+ 
+ from .algorithms.base import RLAlgorithm
+ from .algorithms.configs import TrainingStats
+@@ -74,12 +74,29 @@ class RLTrainer:
+         return self.algorithm.update(self._iterator)
+ 
+ 
++def _find_pipeline_step(pipeline: Any, step_class_name: str) -> Any | None:
++    """按类名在处理器管道里找某一步（避免为拿归一化步骤而耦合具体实现类）。"""
++    return next((s for s in getattr(pipeline, "steps", []) if type(s).__name__ == step_class_name), None)
++
++
+ def preprocess_rl_batch(preprocessor: Any, batch: BatchType) -> BatchType:
+-    """Apply policy preprocessing to RL observations only."""
+-    observations = batch["state"]
+-    next_observations = batch["next_state"]
+-    batch["state"] = preprocessor.process_observation(observations)
+-    batch["next_state"] = preprocessor.process_observation(next_observations)
++    """Apply policy preprocessing to RL observations **and actions**.
++
++    本地定制（2026-09-21）：**动作也必须归一化**（原来只处理观测 —— 这是"策略怎么训都学不会"的根因）。
++    为什么：策略网络 ``policy.actor(...)`` 的输出是**归一化尺度**（actor 侧再由 postprocessor 反归一化后
++    才交给环境），而 ``batch["action"]`` 存的是**环境尺度**动作。只归一化观测时，critic 被要求拟合
++        Q(s, 环境尺度动作) ≈ r + γ·Q_target(s′, 策略输出的归一化尺度动作)
++    —— 同一个等式里混了两套动作尺度。实测差距：gripper 维整整差 1.0（环境 [0,2] vs 归一化 [-1,1]）；
++    x/y/z 维因为 min/max 恰好是 ±1，归一化是恒等映射，所以肉眼完全看不出来。
++    后果：TD 误差永远无法收敛 → Q 值不自洽 → 策略梯度失效 → 策略从头到尾随机。
++    """
++    batch["state"] = preprocessor.process_observation(batch["state"])
++    batch["next_state"] = preprocessor.process_observation(batch["next_state"])
++
++    action = batch.get(TransitionKey.ACTION)
++    normalizer = _find_pipeline_step(preprocessor, "NormalizerProcessorStep")
++    if action is not None and normalizer is not None:
++        batch[TransitionKey.ACTION] = normalizer({TransitionKey.ACTION: action})[TransitionKey.ACTION]
+ 
+     return batch
+ 
+diff --git a/src/lerobot/robots/so_follower/robot_kinematic_processor.py b/src/lerobot/robots/so_follower/robot_kinematic_processor.py
+index ac2ec1f8..ce5c32cf 100644
+--- a/src/lerobot/robots/so_follower/robot_kinematic_processor.py
++++ b/src/lerobot/robots/so_follower/robot_kinematic_processor.py
+@@ -15,6 +15,7 @@
+ # limitations under the License.
+ 
+ import logging
++import time
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
+@@ -209,6 +210,14 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
+     max_ee_step_m: float = 0.05
+     raise_on_jump: bool = True
+     _last_pos: np.ndarray | None = field(default=None, init=False, repr=False)
++    # 本地定制（2026-09-21）：裁剪提示用「10 秒时间窗 + 计数」限流。
++    # 教训：最初做成"进入裁剪状态提示一次"，但目标的 z 会在 0.0 上下反复穿越
++    # （贴近桌面时几乎每步都裁一次又回到盒内）→ 10 步刷 6 行，把日志淹了。
++    _clip_steps: int = field(default=0, init=False, repr=False)
++    _window_steps: int = field(default=0, init=False, repr=False)
++    _window_start: float = field(default=0.0, init=False, repr=False)
++    _clip_axes: str = field(default="", init=False, repr=False)
++    _clip_target: list = field(default_factory=list, init=False, repr=False)
+ 
+     def action(self, action: RobotAction) -> RobotAction:
+         x = action["ee.x"]
+@@ -228,7 +237,30 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
+         twist = np.array([wx, wy, wz], dtype=float)
+ 
+         # Clip position
+-        pos = np.clip(pos, self.end_effector_bounds["min"], self.end_effector_bounds["max"])
++        clipped = np.clip(pos, self.end_effector_bounds["min"], self.end_effector_bounds["max"])
++        # 本地定制（2026-09-21）：裁剪原本是【静默】的 —— 用户只看到"手臂不动"，会误判成硬件故障。
++        # 但也不能每步都报（贴近桌面时 z 会在下限附近反复穿越，10 步能刷 6 行）→
++        # 用【10 秒窗口 + 计数】限流：窗口内每步累计，窗口到期时汇总提示一次。
++        now = time.monotonic()
++        if self._window_start == 0.0:
++            self._window_start = now
++        if not np.allclose(clipped, pos):
++            self._clip_steps += 1
++            self._clip_axes = "".join("xyz"[i] for i in range(3) if not np.isclose(clipped[i], pos[i]))
++            self._clip_target = np.round(pos, 3).tolist()
++        self._window_steps += 1
++        if now - self._window_start >= 10.0:
++            if self._clip_steps:
++                logger.warning(
++                    "[工作空间] 近 %.0f 秒有 %d/%d 步被方盒裁剪（最近方向 %s，目标 %s → 裁剪为盒边界）；"
++                    "频繁出现说明目标点超出该姿态的可达范围（不是硬件故障）；"
++                    "若长期只在某方向贴着边界，可放宽配置里的 end_effector_bounds。",
++                    now - self._window_start, self._clip_steps, self._window_steps,
++                    self._clip_axes, self._clip_target,
++                )
++            self._clip_steps = self._window_steps = 0
++            self._window_start = now
++        pos = clipped
+ 
+         # Check for jumps in position
+         if self._last_pos is not None:
+diff --git a/src/lerobot/robots/so_follower/so_follower.py b/src/lerobot/robots/so_follower/so_follower.py
+index 6d5ad79d..7102f62a 100644
+--- a/src/lerobot/robots/so_follower/so_follower.py
++++ b/src/lerobot/robots/so_follower/so_follower.py
+@@ -180,7 +180,9 @@ class SOFollower(Robot):
+     def get_observation(self) -> RobotObservation:
+         # Read arm position
+         start = time.perf_counter()
+-        obs_dict = self.bus.sync_read("Present_Position")
++        # 本地定制（2026-09-21）：sync_read 默认 num_retry=0 —— 一次 USB 瞬时抖动就会
++        # 报 "no status packet" 并让整个训练进程崩掉（实测已发生两次）。这里加 3 次重试。
++        obs_dict = self.bus.sync_read("Present_Position", num_retry=3)
+         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
+         dt_ms = (time.perf_counter() - start) * 1e3
+         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
+@@ -221,12 +223,13 @@ class SOFollower(Robot):
+         # Cap goal position when too far away from present position.
+         # /!\ Slower fps expected due to reading from the follower.
+         if self.config.max_relative_target is not None:
+-            present_pos = self.bus.sync_read("Present_Position")
++            present_pos = self.bus.sync_read("Present_Position", num_retry=3)   # 本地定制：加抗抖动重试
+             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
+             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+ 
+         # Send goal position to the arm
+-        self.bus.sync_write("Goal_Position", goal_pos)
++        # 本地定制（2026-09-21）：写指令也加 3 次重试（原: 无重试）
++        self.bus.sync_write("Goal_Position", goal_pos, num_retry=3)
+         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+ 
+     @check_if_not_connected
+diff --git a/src/lerobot/teleoperators/gamepad/gamepad_utils.py b/src/lerobot/teleoperators/gamepad/gamepad_utils.py
+index 22dbb7cc..9c545669 100644
+--- a/src/lerobot/teleoperators/gamepad/gamepad_utils.py
++++ b/src/lerobot/teleoperators/gamepad/gamepad_utils.py
+@@ -225,6 +225,9 @@ class GamepadController(InputController):
+         require_package("pygame", extra="gamepad")
+         super().__init__(x_step_size, y_step_size, z_step_size)
+         self.deadzone = deadzone
++        self._lt_latched = False  # LT 滞回状态（本地定制：防夹爪抖动）
++        self._rt_latched = False  # RT 滞回状态
++        self._rb_prev = False     # RB 边沿检测（本地定制：接管改为"按一下切换"）
+         self.joystick = None
+         self.intervention_flag = False
+ 
+@@ -240,6 +243,10 @@ class GamepadController(InputController):
+ 
+         self.joystick = pygame.joystick.Joystick(0)
+         self.joystick.init()
++        # 本地定制：启动即打印键位表（确认手柄已被识别）
++        print(f"[手柄] 已连接: {self.joystick.get_name()} | "
++              "RB=按一下切换接管 | 左摇杆=前后/左右 | 右摇杆=升/降 | LT=张开夹爪 | RT=闭合夹爪 | "
++              "Y=标记成功 | B=标记失败 | A=重录本回合")
+         logging.info(f"Initialized gamepad: {self.joystick.get_name()}")
+ 
+         print("Gamepad controls:")
+@@ -271,41 +278,39 @@ class GamepadController(InputController):
+                 elif event.button == 0:
+                     self.episode_end_status = TeleopEvents.RERECORD_EPISODE
+ 
+-                # RB button (6) for closing gripper
+-                elif event.button == 6:
+-                    self.close_gripper_command = True
+-
+-                # LT button (7) for opening gripper
+-                elif event.button == 7:
+-                    self.open_gripper_command = True
+-
+             # Reset episode status on button release
+             elif event.type == pygame.JOYBUTTONUP:
+                 if event.button in [0, 2, 3]:
+                     self.episode_end_status = None
+ 
+-                elif event.button == 6:
+-                    self.close_gripper_command = False
+-
+-                elif event.button == 7:
+-                    self.open_gripper_command = False
+-
+-            # Check for RB button (typically button 5) for intervention flag
+-            if self.joystick.get_button(5):
+-                self.intervention_flag = True
+-            else:
+-                self.intervention_flag = False
++        # 以下每帧轮询（原版在事件循环内：无事件则不刷新，会卡住上一次的接管/夹爪状态）
++        # 本地定制：RB(5) 由"一直按住"改为【按一下切换接管/交还】
++        # （原版要求持续按住 RB，食指被占用就没法推摇杆，实际不可用）
++        rb = bool(self.joystick.get_button(5))
++        if rb and not self._rb_prev:
++            self.intervention_flag = not self.intervention_flag
++            print(f"[手柄] {'🟢 已接管：现在可以操控机械臂' if self.intervention_flag else '⚪ 已交还：机械臂不再响应手柄'}")
++        self._rb_prev = rb
++
++        # 本地定制（Xbox）：LT/RT 是【轴】不是按钮（原版用 button 6/7 = Back/Start，无效）
++        # 滞回：过半程才触发、退回 0.2 以下才释放（否则扳机停在阈值附近会使夹爪来回抖）
++        try:
++            lt, rt = self.joystick.get_axis(2), self.joystick.get_axis(5)
++            self._lt_latched = lt > (0.2 if self._lt_latched else 0.5)
++            self._rt_latched = rt > (0.2 if self._rt_latched else 0.5)
++            self.open_gripper_command = self._lt_latched
++            self.close_gripper_command = self._rt_latched
++        except pygame.error:
++            pass
+ 
+     def get_deltas(self):
+         """Get the current movement deltas from gamepad state."""
+         try:
+-            # Read joystick axes
+-            # Left stick X and Y (typically axes 0 and 1)
+-            y_input = self.joystick.get_axis(0)  # Up/Down (often inverted)
+-            x_input = self.joystick.get_axis(1)  # Left/Right
+-
+-            # Right stick Y (typically axis 3 or 4)
+-            z_input = self.joystick.get_axis(3)  # Up/Down for Z
++            # 本地定制（Xbox/xpadneo 呈 Xbox360 布局）：左摇杆 axis0/1 = 横/纵，右摇杆 axis4 = 纵
++            # 原版把 axis3 当 z、axis0/1 当 y/x，在 Xbox 上"升降"要左右推、前后左右颠倒。
++            x_input = self.joystick.get_axis(0)  # 左摇杆 水平 → 左右
++            y_input = self.joystick.get_axis(1)  # 左摇杆 垂直 → 前后
++            z_input = self.joystick.get_axis(4)  # 右摇杆 垂直 → 升降
+ 
+             # Apply deadzone to avoid drift
+             x_input = 0 if abs(x_input) < self.deadzone else x_input
+@@ -313,9 +318,10 @@ class GamepadController(InputController):
+             z_input = 0 if abs(z_input) < self.deadzone else z_input
+ 
+             # Calculate deltas (note: may need to invert axes depending on controller)
+-            delta_x = -x_input * self.x_step_size  # Forward/backward
+-            delta_y = -y_input * self.y_step_size  # Left/right
+-            delta_z = -z_input * self.z_step_size  # Up/down
++            # 本地定制：垂直摇杆喂 delta_x（EE 的 x 约等于"向前"），水平摇杆喂 delta_y
++            delta_x = -y_input * self.x_step_size  # 前后：推上 → EE 向前
++            delta_y = -x_input * self.y_step_size  # 左右：推右 → EE 向右
++            delta_z = -z_input * self.z_step_size  # 升降：推上 → EE 上升
+ 
+             return delta_x, delta_y, delta_z
+ 
+diff --git a/src/lerobot/teleoperators/keyboard/teleop_keyboard.py b/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
+index 872cc7a2..b59a1d1a 100644
+--- a/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
++++ b/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
+@@ -14,7 +14,12 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import atexit
+ import logging
++import os
++import select
++import sys
++import threading
+ import time
+ from queue import Queue
+ from typing import Any
+@@ -42,6 +47,129 @@ if PYNPUT_AVAILABLE:
+         logging.info("Could not import pynput keyboard backend: %s", e)
+ 
+ 
++class TerminalKeyReader:
++    """本地定制（2026-09-21）：Wayland 下 pynput 抓不到全局按键时的【回退后端】。
++
++    直接读当前终端的按键（termios cbreak，不经显示服务器），把事件按与 pynput 后端
++    完全相同的格式交给 teleop（特殊键用 pynput 的 Key 对象、字母用字符），
++    因此上层 get_action()/get_teleop_events() 一行都不用改。
++
++    终端只有"按下"、没有"松开"事件 → 靠系统键盘重复：某键 HOLD_S 秒内没再出现即视为松开。
++    修饰键（Shift/Ctrl/Alt）不产生字节、终端读不到 → z 轴与夹爪改用字母键 r/f/o/c。
++    """
++
++    HOLD_S = 0.25      # 超过这么久没重复 → 视为松开
++    RE_EMIT_S = 0.08   # 按住期间每这么久重申一次"按下"
++
++    def __init__(self, on_event):
++        import termios
++        import tty
++
++        if not sys.stdin.isatty():
++            raise RuntimeError("stdin 不是交互终端，无法终端读键")
++        self._termios = termios
++        self.fd = sys.stdin.fileno()
++        self.old_attrs = termios.tcgetattr(self.fd)
++        tty.setcbreak(self.fd)
++        new_attrs = termios.tcgetattr(self.fd)
++        new_attrs[3] &= ~termios.ECHO
++        termios.tcsetattr(self.fd, termios.TCSADRAIN, new_attrs)
++        self._on_event = on_event
++        self._alive = False
++        self._thread: threading.Thread | None = None
++        self._held: dict[Any, float] = {}
++        self._last_emit: dict[Any, float] = {}
++        self._lock = threading.Lock()
++        atexit.register(self.stop)
++
++    def _read1(self, timeout: float):
++        try:
++            ready, _, _ = select.select([self.fd], [], [], timeout)
++        except OSError:
++            return None
++        if not ready:
++            return None
++        try:
++            data = os.read(self.fd, 1)
++        except OSError:
++            return None
++        return data.decode(errors="ignore") or None
++
++    def _parse(self, ch: str):
++        if ch == "\x1b":
++            c2 = self._read1(0.02)
++            if c2 is None:
++                return keyboard.Key.esc if keyboard is not None else None
++            if c2 in ("[", "O"):
++                c3 = self._read1(0.02)
++                return {
++                    "A": keyboard.Key.up, "B": keyboard.Key.down,
++                    "C": keyboard.Key.right, "D": keyboard.Key.left,
++                }.get(c3 or "")
++            return None
++        if ch in "\r\n":
++            return keyboard.Key.enter if keyboard is not None else None
++        if ch == " ":
++            return keyboard.Key.space if keyboard is not None else None
++        if ch.isprintable():
++            return ch.lower()
++        return None
++
++    def _run(self) -> None:
++        try:
++            self._run_inner()
++        except Exception:  # noqa: BLE001
++            # 线程里抛异常会【静默死亡】，症状是"按键怎么按都没反应"，必须吼出来
++            logging.exception("终端读键线程异常退出（按键将失效）")
++            self._alive = False
++
++    def _run_inner(self) -> None:
++        while self._alive:
++            ch = self._read1(0.02)
++            now = time.perf_counter()
++            if ch is not None:
++                key = self._parse(ch)
++                if key is not None:
++                    with self._lock:
++                        self._held[key] = now
++                    # 每次重复都上报"按下"：上层 get_teleop_events() 会清空状态，
++                    # 靠重复补齐（pynput 后端同理）。
++                    self._on_event(key, True)
++            # 按住期间定期重申"按下"：上层 get_teleop_events() 每次会清空按键状态，
++            # 只靠键盘重复补齐会很脆（轻点一下可能整帧都采不到）→ 这里主动补发。
++            with self._lock:
++                held_now = dict(self._held)
++            for k, _t in held_now.items():
++                if now - self._last_emit.get(k, 0.0) >= self.RE_EMIT_S:
++                    self._last_emit[k] = now
++                    self._on_event(k, True)
++            with self._lock:
++                expired = [k for k, t in self._held.items() if now - t > self.HOLD_S]
++                for k in expired:
++                    del self._held[k]
++                    self._last_emit.pop(k, None)
++            for k in expired:
++                self._on_event(k, False)
++
++    def start(self) -> None:
++        self._alive = True
++        self._thread = threading.Thread(target=self._run, daemon=True)
++        self._thread.start()
++
++    def is_alive(self) -> bool:
++        return bool(self._alive and self._thread is not None and self._thread.is_alive())
++
++    def stop(self) -> None:
++        self._alive = False
++        if self._thread is not None:
++            self._thread.join(timeout=0.5)
++            self._thread = None
++        try:
++            self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self.old_attrs)
++        except Exception:  # noqa: BLE001
++            pass
++
++
+ class KeyboardTeleop(Teleoperator):
+     """
+     Teleop class to use keyboard inputs for control.
+@@ -75,7 +203,15 @@ class KeyboardTeleop(Teleoperator):
+ 
+     @property
+     def is_connected(self) -> bool:
+-        return PYNPUT_AVAILABLE and isinstance(self.listener, keyboard.Listener) and self.listener.is_alive()
++        # 本地定制：兼容终端读键后端（Wayland 回退）
++        if isinstance(self.listener, TerminalKeyReader):
++            return self.listener.is_alive()
++        return (
++            PYNPUT_AVAILABLE
++            and keyboard is not None
++            and isinstance(self.listener, keyboard.Listener)
++            and self.listener.is_alive()
++        )
+ 
+     @property
+     def is_calibrated(self) -> bool:
+@@ -90,6 +226,14 @@ class KeyboardTeleop(Teleoperator):
+                 on_release=self._on_release,
+             )
+             self.listener.start()
++        elif sys.stdin.isatty():
++            # 本地定制（2026-09-21）：Wayland 下 pynput 抓不到全局按键 → 回退读终端。
++            logging.warning(
++                "pynput 无法抓取全局按键（Wayland/无显示）→ 已回退到【终端读键】。"
++                "请保持运行本程序的终端窗口处于焦点；z 轴用 r/f、夹爪用 o/c（修饰键终端读不到）。"
++            )
++            self.listener = TerminalKeyReader(self._on_event_adapter)
++            self.listener.start()
+         else:
+             logging.warning(
+                 "Keyboard teleoperation is unavailable in this environment. pynput can only "
+@@ -103,6 +247,13 @@ class KeyboardTeleop(Teleoperator):
+     def calibrate(self) -> None:
+         pass
+ 
++    def _on_event_adapter(self, key, is_pressed: bool) -> None:
++        """本地定制：终端读键后端 → 复用与 pynput 相同的按下/松开处理。"""
++        if is_pressed:
++            self._on_press(key)
++        else:
++            self._on_release(key)
++
+     def _on_press(self, key):
+         if hasattr(key, "char"):
+             key = key.char
+@@ -197,11 +348,37 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
+                 delta_z = -int(val)
+             elif key == keyboard.Key.shift_r:
+                 delta_z = int(val)
++            # 本地定制（2026-09-21）：用户键盘【没有右 Shift】，补字母键做 z 轴
++            elif key == "t":
++                delta_z = int(val)     # t = 上升（等价右 Shift）
++            elif key == "g":
++                delta_z = -int(val)    # g = 下降（等价左 Shift）
+             elif key == keyboard.Key.ctrl_r:
+-                # Gripper actions are expected to be between 0 (close), 1 (stay), 2 (open)
+-                gripper_action = int(val) + 1
+-            elif key == keyboard.Key.ctrl_l:
++                # 本地定制：本机夹爪方向与约定相反 → 已对调（原: +1=open）
+                 gripper_action = int(val) - 1
++            elif key == keyboard.Key.ctrl_l:
++                gripper_action = int(val) + 1
++            # ── 本地定制（2026-09-21）：与直控脚本统一的字母键 ──
++            # 注意：官方把【上下】接到 y 轴、【左右】接到 x 轴，直接用会"前进变横移"，
++            # 所以字母键按【直觉】重新分配：w/s 走 x（前后），a/d 走 y（左右）。
++            elif key == "w":
++                delta_x = int(val)                        # 前 → x 轴正向
++            elif key == "s":
++                delta_x = -int(val)                       # 后
++            elif key == "a":
++                delta_y = int(val)                        # 左 → y 轴正向
++            elif key == "d":
++                delta_y = -int(val)                       # 右
++            elif key == "r":
++                delta_z = int(val)                        # 上升
++            elif key == "f":
++                delta_z = -int(val)                       # 下降
++            # 夹爪：本机夹爪物理方向与 LeRobot 约定相反 → 这里把开/合对调
++            # （官方 Ctrl 键同样对调，保证所有键位一致）
++            elif key == "o":
++                gripper_action = int(val) - 1             # 张开（本机 = 动作 0）
++            elif key == "c":
++                gripper_action = int(val) + 1             # 闭合（本机 = 动作 2）
+             elif val:
+                 # If the key is pressed, add it to the misc_keys_queue
+                 # this will record key presses that are not part of the delta_x, delta_y, delta_z
+@@ -255,8 +432,27 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
+             keyboard.Key.shift_r,
+             keyboard.Key.ctrl_r,
+             keyboard.Key.ctrl_l,
++            "t",   # 本地定制：无右 Shift → t 代上升
++            "g",   # 本地定制：g 代下降
++            "w", "s", "a", "d", "r", "f", "o", "c",   # 本地定制：统一字母键
+         ]
+-        is_intervention = any(self.current_pressed.get(key, False) for key in movement_keys)
++        # ── 本地定制（2026-09-21）：接管改为【切换式】（官方文档在线训练阶段的语义）──
++        # 之前的"按住移动键=接管"有个致命缺陷：在线训练时你一松手（键盘重复的间隙），
++        # 策略立刻抢回控制把机械臂带走。改成：
++        #   · 按一次【空格】→ 接管（此后即使不按键也保持接管；不按键=保持不动）
++        #   · 再按一次空格 → 交还给策略
++        #   · 首次按下移动键 → 自动接管（保证键位始终好使），但【不会】自动交还
++        _space_now = bool(self.current_pressed.get(keyboard.Key.space, False))
++        if _space_now and not getattr(self, "_space_prev", False):
++            self._takeover = not getattr(self, "_takeover", False)
++        self._space_prev = _space_now
++        if any(self.current_pressed.get(key, False) for key in movement_keys):
++            self._takeover = True
++        # 本地定制：一旦你按了 y/u/q（成功/重录/结束本回合），【立即】把控制交还给策略，
++        # 免得你"标完成功还在接管"、看着机械臂不动以为卡住了。
++        if self.current_pressed.get("y") or self.current_pressed.get("u") or self.current_pressed.get("q"):
++            self._takeover = False
++        is_intervention = bool(getattr(self, "_takeover", False))
+ 
+         self.current_pressed.clear()
+ 
+@@ -268,9 +464,10 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
+         # Process any pending misc keys
+         while not self.misc_keys_queue.empty():
+             key = self.misc_keys_queue.get_nowait()
+-            if key == "s":
++            # 本地定制：s/r 已让给移动键，成功改 y、重录改 u
++            if key in ("s", "y"):
+                 success = True
+-            elif key == "r":
++            elif key in ("r", "u"):
+                 terminate_episode = True
+                 rerecord_episode = True
+             elif key == "q":
+diff --git a/src/lerobot/utils/keyboard_input.py b/src/lerobot/utils/keyboard_input.py
+index 00c0f53e..f92a6d1b 100644
+--- a/src/lerobot/utils/keyboard_input.py
++++ b/src/lerobot/utils/keyboard_input.py
+@@ -430,7 +430,7 @@ def init_keyboard_listener():
+         key = name.lower()
+         if key in ("right", "n"):
+             apply_recording_control("right", events)
+-        elif key in ("left", "r"):
++        elif key in ("left", "u"):   # 本地定制：r 已让给遥操的"上升"，重录改用 u
+             apply_recording_control("left", events)
+         elif key in ("esc", "q"):
+             apply_recording_control("esc", events)

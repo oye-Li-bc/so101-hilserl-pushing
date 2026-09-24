@@ -1,0 +1,315 @@
+{
+    "output_dir": "/home/lbc/output_lerobot_train/push_cube/sac_v1",
+    "job_name": "push_cube",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 4,
+    "batch_size": 256,
+    "steps": 100000,
+    "log_freq": 500,
+    "save_checkpoint": true,
+    "save_freq": 1000,
+    "wandb": {
+        "enable": true,
+        "project": "push_cube",
+        "disable_artifact": true
+    },
+    "dataset": {
+        "repo_id": "oye-Li-bc/push_cube_v2",
+        "use_imagenet_stats": false
+    },
+    "algorithm": {
+        "type": "sac",
+        "actor_lr": 0.0003,
+        "critic_lr": 0.0003,
+        "temperature_lr": 0.0003,
+        "discount": 0.97,
+        "use_backup_entropy": true,
+        "critic_target_update_weight": 0.005,
+        "num_critics": 2,
+        "num_subsample_critics": null,
+        "critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "discrete_critic_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true,
+            "final_activation": null
+        },
+        "temperature_init": 0.01,
+        "target_entropy": null,
+        "utd_ratio": 2,
+        "policy_update_freq": 1,
+        "grad_clip_norm": 40.0,
+        "use_torch_compile": false
+    },
+    "mixer": "online_offline",
+    "online_ratio": 0.5,
+    "policy": {
+        "type": "gaussian_actor",
+        "push_to_hub": false,
+        "n_obs_steps": 1,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MIN_MAX",
+            "ENV": "MIN_MAX",
+            "ACTION": "MIN_MAX"
+        },
+        "input_features": {
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    18
+                ]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    3
+                ]
+            }
+        },
+        "dataset_stats": {
+            "observation.images.front": {
+                "mean": [
+                    0.627007,
+                    0.62716,
+                    0.627679
+                ],
+                "std": [
+                    0.20976,
+                    0.205663,
+                    0.174149
+                ]
+            },
+            "observation.state": {
+                "min": [
+                    -41.274727,
+                    4.923077,
+                    -55.384617,
+                    65.230766,
+                    -32.21978,
+                    0.960878,
+                    -28.131868,
+                    -38.681297,
+                    -77.362633,
+                    -27.252731,
+                    -28.131866,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                "max": [
+                    9.538462,
+                    55.12088,
+                    31.032967,
+                    94.85714,
+                    17.89011,
+                    0.960878,
+                    30.769234,
+                    45.714283,
+                    90.549469,
+                    32.527542,
+                    29.890108,
+                    0.0,
+                    2.0,
+                    40.0,
+                    20.0,
+                    4.0,
+                    1.0,
+                    1.0
+                ]
+            },
+            "action": {
+                "min": [
+                    -1.0,
+                    -1.0,
+                    -1.0
+                ],
+                "max": [
+                    1.0,
+                    1.0,
+                    1.0
+                ]
+            }
+        },
+        "device": "cuda",
+        "storage_device": "cuda",
+        "use_amp": false,
+        "vision_encoder_name": "/home/lbc/models/lerobot_resnet10",
+        "freeze_vision_encoder": true,
+        "image_encoder_hidden_dim": 32,
+        "shared_encoder": true,
+        "online_steps": 1000000,
+        "online_buffer_capacity": 30000,
+        "offline_buffer_capacity": 10000,
+        "online_step_before_learning": 10,
+        "state_encoder_hidden_dim": 256,
+        "latent_dim": 256,
+        "actor_network_kwargs": {
+            "hidden_dims": [
+                256,
+                256
+            ],
+            "activate_final": true
+        },
+        "policy_kwargs": {
+            "use_tanh_squash": true,
+            "std_min": -5,
+            "std_max": 2,
+            "init_final": 0.05
+        },
+        "actor_learner_config": {
+            "learner_host": "127.0.0.1",
+            "learner_port": 50051,
+            "policy_parameters_push_frequency": 4
+        },
+        "concurrency": {
+            "actor": "threads",
+            "learner": "threads"
+        },
+        "repo_id": null
+    },
+    "env": {
+        "type": "gym_manipulator",
+        "name": "real_robot",
+        "fps": 10,
+        "robot": {
+            "type": "so101_follower",
+            "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79050540-if00",
+            "use_degrees": true,
+            "id": "oye_follower_arm",
+            "cameras": {
+                "front": {
+                    "type": "opencv",
+                    "index_or_path": "/dev/v4l/by-id/usb-2MP_USB_Camera_2MP_USB_Camera_04434000_P120800_SN0002-video-index0",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "fourcc": "MJPG"
+                }
+            }
+        },
+        "teleop": {
+            "type": "keyboard_ee",
+            "use_gripper": true
+        },
+        "processor": {
+            "control_mode": "keyboard",
+            "max_gripper_pos": 100.0,
+            "observation": {
+                "display_cameras": false,
+                "add_joint_velocity_to_observation": true,
+                "add_current_to_observation": true,
+                "add_ee_pose_to_observation": false
+            },
+            "image_preprocessing": {
+                "crop_params_dict": {
+                    "observation.images.front": [
+                        225,
+                        679,
+                        805,
+                        966
+                    ]
+                },
+                "resize_size": [
+                    128,
+                    128
+                ]
+            },
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": 0.0
+            },
+            "reset": {
+                "fixed_reset_joint_positions": [
+                    -41.32,
+                    43.34,
+                    -40.88,
+                    90.64,
+                    -32.22,
+                    0.79
+                ],
+                "reset_time_s": 5.0,
+                "control_time_s": 20.0,
+                "terminate_on_success": true
+            },
+            "inverse_kinematics": {
+                "urdf_path": "/home/lbc/Projects/AI-Study/hilserl/urdf/so101_new_calib.urdf",
+                "target_frame_name": "gripper_frame_link",
+                "end_effector_bounds": {
+                    "min": [
+                        0.1076,
+                        -0.1023,
+                        -0.0294
+                    ],
+                    "max": [
+                        0.2965,
+                        0.2091,
+                        0.0589
+                    ]
+                },
+                "end_effector_step_sizes": {
+                    "x": 0.009,
+                    "y": 0.009,
+                    "z": 0.01
+                }
+            },
+            "reward_classifier": {
+                "pretrained_path": null,
+                "success_threshold": 0.5,
+                "success_reward": 1.0
+            }
+        },
+        "task": "push_gray_cube_into_black_tape_area",
+        "features": {
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    128,
+                    128
+                ]
+            },
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    18
+                ]
+            },
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    3
+                ]
+            }
+        },
+        "features_map": {
+            "observation.images.front": "observation.images.front",
+            "observation.state": "observation.state",
+            "action": "action"
+        }
+    }
+}
