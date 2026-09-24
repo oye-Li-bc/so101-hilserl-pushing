@@ -10,6 +10,8 @@
 >
 > 用的是**动画 WebP**（1.8 MB）。同样内容转 GIF 要 14.4 MB 而且更糊 —— 原速下 GIF 压不住体积。
 
+📥 **完整原视频**（67 秒，6 次测试全程，无剪辑）：[results/demo_video/policy_21000_full.mp4](results/demo_video/policy_21000_full.mp4)
+
 ## 📊 成果概览
 
 - **任务**：把物体（灰色方块 / 灰色圆柱）推进黑胶带目标区

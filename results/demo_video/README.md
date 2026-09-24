@@ -16,7 +16,8 @@
 
 | 文件 | 内容 |
 |---|---|
-| `assets/demo.gif` / `demo.webp` | 21,000 步策略真机自主推物体（手机实拍，8 倍速）|
+| `policy_21000_full.mp4` | ✅ **完整原视频**（67 秒 / 13.3 MB，6 次测试全程无剪辑）|
+| `assets/demo.webp` | 前 10 秒原速动图（README 内嵌用，1.8 MB）|
 | `results/training_curves/loss_actor.png` | Actor 损失曲线（导出自 wandb）|
 | `results/training_curves/loss_critic.png` | Critic 损失曲线（导出自 wandb）|
 

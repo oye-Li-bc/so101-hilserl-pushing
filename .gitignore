@@ -17,9 +17,9 @@ eval_*/
 data/chunk-*/
 data/videos/
 
-# 演示视频（放 B站，README 放链接）
+# 演示视频：只保留完整版原视频，其余放 B站/外链
 *.mp4
-results/demo_video/*.mp4
+!results/demo_video/policy_21000_full.mp4
 !results/demo_video/README.md
 
 # 系统文件
