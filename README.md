@@ -122,9 +122,9 @@ bash scripts/deploy.sh
 
 ## 🙏 致谢
 
-- 复现路线参考 [hxdoit](https://github.com/hxdoit) 的 HIL-SERL 分支
+- 复现路线参考 **hxdoit** 的 HIL-SERL 分支及其复现教程：
+  [《具身智能 hil-serl 强化学习算法在 lerobot 机械臂上复现》](https://zhuanlan.zhihu.com/p/1976053620911906986)（知乎 @持续学习的程序员）
 - 框架：[LeRobot](https://github.com/huggingface/lerobot)
-- 参考资料：[知乎专栏文章](https://zhuanlan.zhihu.com/p/1976053620911906986)
 
 ## 📄 License
 
