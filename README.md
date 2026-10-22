@@ -1,6 +1,6 @@
 # SO-ARM101 · HIL-SERL Pushing
 
-![SO-ARM101 · HIL-SERL Pushing 项目封面](.github/readme/cover.svg)
+![SO-ARM101 · HIL-SERL Pushing 项目封面](.github/readme/cover-imagegen.webp)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-516d64)](LICENSE)
 ![HIL-SERL / SAC](https://img.shields.io/badge/HIL--SERL%20%2F%20SAC-project-516d64)
@@ -158,4 +158,4 @@ MIT License
 
 ---
 
-[个人作品集](https://oye-li-bc.github.io/) · [可编辑封面与配图说明](.github/readme/README.md)
+[个人作品集](https://oye-li-bc.github.io/) · [封面来源与配图说明](.github/readme/README.md)
