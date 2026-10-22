@@ -1,6 +1,21 @@
-# so101-hilserl-pushing
+# SO-ARM101 · HIL-SERL Pushing
+
+![SO-ARM101 · HIL-SERL Pushing 项目封面](.github/readme/cover.svg)
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-516d64)](LICENSE)
+![HIL-SERL / SAC](https://img.shields.io/badge/HIL--SERL%20%2F%20SAC-project-516d64)
+[![Portfolio](https://img.shields.io/badge/oye-portfolio-516d64)](https://oye-li-bc.github.io/)
 
 基于 **HIL-SERL**（Human-in-the-Loop Sample-Efficient Reinforcement Learning）的真机强化学习项目，运行在 SO-ARM101 六自由度机械臂上，使用 LeRobot 框架完成「少量示教 → 在线自主探索 → 真机稳定执行」的完整闭环。
+
+**[演示效果](#demo) · [实验记录](#results) · [快速复现](#quickstart) · [技术文档](#docs)**
+
+<picture>
+  <source media="(max-width: 600px)" srcset=".github/readme/workflow-mobile.svg">
+  <img src=".github/readme/workflow.svg" alt="项目学习与运行路线概览，完整步骤及依赖见下文说明">
+</picture>
+
+<a id="demo"></a>
 
 ## 🎥 演示效果
 
@@ -11,6 +26,8 @@
 > 用的是**动画 WebP**（1.8 MB）。同样内容转 GIF 要 14.4 MB 而且更糊 —— 原速下 GIF 压不住体积。
 
 📥 **完整原视频**（67 秒，6 次测试全程，无剪辑）：[results/demo_video/policy_21000_full.mp4](results/demo_video/policy_21000_full.mp4)
+
+<a id="results"></a>
 
 ## 📊 成果概览
 
@@ -68,6 +85,8 @@ so101-hilserl-pushing/
 └── assets/      # README 演示动图（demo.gif / demo.webp）
 ```
 
+<a id="quickstart"></a>
+
 ## 🚀 快速复现
 
 ### 0. 环境
@@ -110,6 +129,8 @@ bash scripts/train.sh
 bash scripts/deploy.sh
 ```
 
+<a id="docs"></a>
+
 ## 📖 详细文档
 
 | 文档 | 内容 |
@@ -129,3 +150,12 @@ bash scripts/deploy.sh
 ## 📄 License
 
 MIT License
+
+## 同系列项目
+
+- [SO-ARM101 · ACT Grasping](https://github.com/oye-Li-bc/so101-act-grasping)
+- [SO-ARM101 · SmolVLA Grasping](https://github.com/oye-Li-bc/so101-smolvla-grasping)
+
+---
+
+[个人作品集](https://oye-li-bc.github.io/) · [可编辑封面与配图说明](.github/readme/README.md)
